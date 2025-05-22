@@ -1,47 +1,52 @@
 import pandas as pd, numpy as np
 import matplotlib.pyplot as plt
-import json, torch, logging, os, cv2, stat, time, csv, seaborn as sns
-from pathlib import Path
+import json, torch, logging, os, cv2, stat, time, seaborn as sns
 from collections import defaultdict
-from sklearn.metrics import confusion_matrix
+from pathlib import Path
+from sklearn.metrics import confusion_matrix, auc
 from typing import List, Dict, Optional, Tuple
 from glob import glob
 
 
 class LoggerManager:
-    def __init__(self, log_file):
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-        
-        if not self.logger.handlers:
-            try:
-                file_handler = logging.FileHandler(log_file, mode='w')
-                file_handler.setLevel(logging.INFO)
-                file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-                file_handler.setFormatter(file_formatter)
-                
-                console_handler = logging.StreamHandler()
-                console_handler.setLevel(logging.INFO)
-                console_formatter = logging.Formatter('%(levelname)s: %(message)s')
-                console_handler.setFormatter(console_formatter)
-                
-                self.logger.addHandler(file_handler)
-                self.logger.addHandler(console_handler)
-            except Exception as e:
-                print(f"Error setting up logger: {e}")
-                raise
+    _loggers = {}
+    def __init__(self, log_file: Path):
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def info(self, message):
+        logger_name = str(log_file.resolve())
+        if logger_name in LoggerManager._loggers:
+            self.logger = LoggerManager._loggers[logger_name]
+        else:
+            self.logger = logging.getLogger(logger_name)
+            self.logger.setLevel(logging.INFO)
+            self.logger.propagate = False  # Cegah log ganda ke root logger
+
+            file_handler = logging.FileHandler(log_file, mode='a')
+            file_handler.setLevel(logging.INFO)
+            file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(file_handler)
+
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+            console_handler.setFormatter(console_formatter)
+            self.logger.addHandler(console_handler)
+
+            LoggerManager._loggers[logger_name] = self.logger
+
+    def info(self, message: str):
         self.logger.info(message)
-    
-    def error(self, message):
+
+    def error(self, message: str):
         self.logger.error(message)
-    
-    def debug(self, message):
+
+    def debug(self, message: str):
         self.logger.debug(message)
 
 class CSVRemaker:
-    def __init__(self, csv_path, olah_path, num_folds, data, model_type, size):
+    def __init__(self, csv_path, olah_path, log_path, num_folds, data, model_type, size):
         self.csv_path = csv_path
         self.num_folds = num_folds
         self.data = data
@@ -49,7 +54,7 @@ class CSVRemaker:
         self.size = size
         self.output_path = olah_path / self.model_type / f'ukuran_{self.size}' / "hasil_csv"
         self.output_path.mkdir(parents=True, exist_ok=True)
-        self.log_path = self.output_path / "log_csv.txt"
+        self.log_path =  log_path / "log_csv.txt"
         self.logger = LoggerManager(log_file=self.log_path)
         self.ensure_directory_exists(self.output_path)
         self.columns = [
@@ -94,7 +99,7 @@ class CSVRemaker:
             return None
         try:
             df = pd.read_csv(csv_path)
-            self.logger.debug(f"Data berhasil dimuat dari {csv_path}")
+            self.logger.info(f"Data berhasil dimuat dari {csv_path}")
             
             # Tambahkan kolom 'epoch' jika tidak ada
             if "epoch" not in df.columns:
@@ -134,7 +139,7 @@ class CSVRemaker:
                     try:
                         output_file = fold_output_path / f"fold_{fold}_{col.replace('/', '_')}.csv"
                         df[["epoch", col]].to_csv(output_file, index=False)
-                        self.logger.debug(f"File CSV Fold-{fold} disimpan di path: {output_file}")
+                        self.logger.info(f"File CSV Fold-{fold} disimpan di path: {output_file}")
                     except Exception as e:
                         self.logger.error(f"Gagal menyimpan file {col} untuk fold {fold}: {e}")
             except Exception as e:
@@ -153,12 +158,13 @@ class CSVRemaker:
                 for col in self.columns:
                     fold_file = self.output_path / f"fold_{fold}" / f"fold_{fold}_{col.replace('/', '_')}.csv"
                     if fold_file.exists():
-                        self.logger.debug(f"Sukses menyimpan file Fold-{fold} yang disimpan di path: {fold_file}") 
+                        self.logger.info(f"Sukses menyimpan file Fold-{fold} yang disimpan di path: {fold_file}") 
                         try:
                             df = pd.read_csv(fold_file)
                             if "epoch" in df.columns:
                                 if combined_dfs[col].empty:
                                     combined_dfs[col] = df.copy()
+                                    combined_dfs[col].rename(columns={col: f"Fold_{fold}"}, inplace=True)
                                 else:
                                     combined_dfs[col][f"Fold_{fold}"] = df[col].copy()
                         except Exception as e:
@@ -173,595 +179,449 @@ class CSVRemaker:
                     try:
                         combined_file = combined_output_path / f"combined_{col.replace('/', '_')}.csv"
                         combined_df.to_csv(combined_file, index=False)
-                        self.logger.debug(f"File gabungan disimpan: {combined_file}")
+                        self.logger.info(f"File gabungan disimpan: {combined_file}")
+
+                        # Simpan file mean/epoch
+                        fold_cols = [c for c in combined_df.columns if c.startswith("Fold_")]
+                        if fold_cols:
+                            mean_df = pd.DataFrame()
+                            mean_df["epoch"] = combined_df["epoch"]
+                            mean_df["mean"] = combined_df[fold_cols].mean(axis=1)
+                            mean_file = combined_output_path / f"mean_{col.replace('/', '_')}.csv"
+                            mean_df.to_csv(mean_file, index=False)
+                            self.logger.info(f"File rata-rata per epoch disimpan: {mean_file}")
                     except Exception as e:
                         self.logger.error(f"Gagal menyimpan file gabungan {col}: {e}")
         except Exception as e:
             self.logger.error(f"Gagal membuat direktori output gabungan: {e}")
 
 class CSVPlotter:
-    def __init__(self, olah_path, num_folds, data, model_type, size):
+    def __init__(self, olah_path, log_path, num_folds, data, model_type, size):
         self.num_folds = num_folds
         self.data = data
         self.model_type = model_type
         self.size = size
-        self.file_path = olah_path / self.model_type / f'ukuran_{self.size}'/ "hasil_csv"
-        self.output_path  = olah_path /  self.model_type / f'ukuran_{self.size}'/ "grafik"
-        self.log_path = olah_path / "hasil_grafik" / "log_plotting.txt"
+        self.file_path = olah_path / model_type / f'ukuran_{size}' / "hasil_csv"
+        self.output_path = olah_path / model_type / f'ukuran_{size}' / "grafik"
+        self.log_path = log_path / "log_plotting.txt"
         self.logger = LoggerManager(log_file=self.log_path)
-        self.results_comp = self.output_path.joinpath("comparison/")
-        self.results_indt = self.output_path.joinpath(f"independent/fold_{self.num_folds}/")
-        self.file_path.mkdir(parents=True, exist_ok=True)
-        self.output_path.mkdir(parents=True, exist_ok=True)
-        self.results_comp.mkdir(parents=True, exist_ok=True)
-        self.results_indt.mkdir(parents=True, exist_ok=True)
+        self.results_comp = self.output_path / "comparison"
+        self.results_indt = self.output_path / f"independent/fold_{num_folds}"
+
+        for path in [self.file_path, self.output_path, self.results_comp, self.results_indt]:
+            path.mkdir(parents=True, exist_ok=True)
 
         self.variables = [
             "train/box_loss", "train/cls_loss", "train/dfl_loss", 
             "val/box_loss", "val/cls_loss", "val/dfl_loss", 
-            "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"
+            "metrics/precision(B)", "metrics/recall(B)", 
+            "metrics/mAP50(B)", "metrics/mAP50-95(B)"
         ]
-        self.var = {var: [] for var in self.variables}
-        self.var["epoch"] = None
-    
-    def ensure_directory_exists(self, directory_path):
-        """Memastikan direktori ada dan memiliki izin yang tepat."""
+
+    def _load_csv(self, filepath):
+        if not filepath.exists():
+            self.logger.error(f"File tidak ditemukan: {filepath}")
+            return None
         try:
-            # Coba buat direktori dengan izin penuh
-            directory_path.mkdir(parents=True, exist_ok=True)
-            
-            # Atur izin penuh untuk direktori (Windows)
-            if os.name == 'nt':  # Windows
-                os.chmod(directory_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
-                
-            return True
-        except PermissionError:
-            self.logger.error(f"Izin ditolak saat membuat {directory_path}, menggunakan lokasi alternatif.")
-            alt_path = Path(os.path.expanduser("~")) / "Documents" / f"temp_output_{int(time.time())}"
-            alt_path.mkdir(parents=True, exist_ok=True)
-            self.logger.info(f"Dibuat direktori alternatif: {alt_path}")
-            self.output_path = alt_path
-            return False
+            return pd.read_csv(filepath)
         except Exception as e:
-            self.logger.error(f"Error membuat direktori {directory_path}: {e}")
-            raise
+            self.logger.error(f"Gagal membaca file {filepath.name}: {e}")
+            return None
 
-    def collect_fold_data(self):
-        fold_results = {}
+    def _plot_curve(self, x, ys_dict, title, ylabel, save_path, use_style_variation=False):
+        plt.figure(figsize=(8, 6))
+        markers = ['o', 's', 'D', '^', 'v', '*', 'x', '+', 'p', 'h']
+        colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
 
-        for fold in range(1, self.num_folds+1):
-            fold_data = {} # Dict untuk menyimpan data per fold
-            
-            # Loop untuk setiap variabel dalam self.variables
+        for i, (label, y) in enumerate(ys_dict.items()):
+            marker = markers[i % len(markers)] if use_style_variation else 'o'
+            color = colors[i % len(colors)] if use_style_variation else 'b'
+            plt.plot(x, y, marker=marker, linestyle='-', color=color, label=label)
+
+        plt.xlabel("Epoch")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+        self.logger.info(f"Plot disimpan: {save_path}")
+
+    def plot_variable(self, target_folds, data):
+        """
+        Membuat plot untuk fold tertentu (atau semua jika target_folds=None).
+        :param target_folds: int atau list of int (misalnya 3 atau [2, 3])
+        """
+        if target_folds is None:
+            folds_to_process = range(1, self.num_folds + 1)
+        elif isinstance(target_folds, int):
+            folds_to_process = [target_folds]
+        elif isinstance(target_folds, (list, tuple)):
+            folds_to_process = target_folds
+        else:
+            self.logger.error(f"Parameter target_folds tidak valid: {target_folds}")
+            return
+
+        for fold in folds_to_process:
             for var in self.variables:
-                # Ubah "/" menjadi "_" agar sesuai dengan nama file
-                var_filename = var.replace("/", "_")
-                fold_path = self.file_path / f"fold_{fold}" / f"fold_{fold}_{var_filename}.csv"
-                try:
-                    if not fold_path.exists():
-                        self.logger.error(f"File {fold_path} tidak ditemukan.")
-                        fold_data[var] = None
-                        continue
-
-                    # Membaca CSV
-                    df = pd.read_csv(fold_path)
-
-                    # Pastikan kolom epoch ada hanya saat membaca file pertama kali
-                    if "epoch" not in df.columns:
-                        self.logger.error(f"Fold {fold}: File CSV {fold_path.name} tidak memiliki kolom 'epoch'.")
-                        fold_data[var] = None
-                        continue
-
-                    fold_data["epoch"] = df["epoch"].tolist()
-
-                    # Simpan data variabel
-                    if var in df.columns:
-                        fold_data[var] = df[var].tolist()
-                    else:
-                        fold_data[var] = None
-                        self.logger.error(f"Fold {fold}: Variabel {var} tidak ditemukan dalam CSV.")
-                except Exception as e:
-                    self.logger.error(f"Kesalahan saat memproses {fold_path}: {e}")
-                    fold_data[var] = None
-
-            # Simpan data fold ini ke dictionary utama
-            fold_results[fold] = fold_data
-        
-        return fold_results # mengembalikan hasil sebagai dict per fold
-    
-    def collect_combined_data(self):
-        """
-        Fungsi ini membaca file CSV gabungan dari berbagai metrik/loss dalam folder 'combined/' 
-        dan menyimpannya dalam struktur data self.var.
-        """
-        combined_results = {}
-        combined_results["epoch"] = None
-        epoch_loaded = False # pastikan dideklarasikan sebelum digunakan
-
-        combined_folder = self.file_path / "combined"
-
-        if not combined_folder.exists():
-            self.logger.error(f"Direktori {combined_folder} tidak ditemukan.")
-            return {}
-        
-        # Loop untuk setiap variabel dalam self.variables
-        for var in self.variables:
-            try:
-                # Ubah "/" menjadi "_" agar sesuai dengan nama file
-                var_filename = var.replace("/", "_")
-                file_path = combined_folder / f"combined_{var_filename}.csv"
-
-                if not file_path.exists():
-                    self.logger.error(f"File {file_path} tidak ditemukan.")
+                filename = var.replace("/", "_")
+                filepath = self.file_path / f"fold_{fold}" / f"fold_{fold}_{filename}.csv"
+                df = self._load_csv(filepath)
+                if df is None or "epoch" not in df or var not in df:
                     continue
-
-                # Membaca CSV
-                df = pd.read_csv(file_path)
-
-                # Pastikan kolom pertama adalah 'epoch'
-                if df.columns[0].lower() != "epoch":
-                    self.logger.error(f"File {file_path.name} tidak memiliki kolom 'epoch' sebagai kolom pertama!")
-                    continue
-
-                # Simpan epoch hanya sekali
-                if not epoch_loaded:
-                    combined_results["epoch"] = df["epoch"].tolist()
-                    epoch_loaded = True  # Tandai bahwa epoch telah berhasil dimuat
-
-                # Ambil semua kolom fold (selain 'epoch')
-                fold_columns = [col for col in df.columns if col != "epoch"]
-
-                if not fold_columns:
-                    self.logger.error(f"File {file_path.name} tidak memiliki data Fold yang valid. Melewati variabel {var}.")
-                    continue
-
-                # Simpan data variabel
-                combined_results[var] = [df[fold_col].tolist() for fold_col in fold_columns]
-                
-            except Exception as e:
-                self.logger.error(f"Kesalahan saat memproses {var}: {e}")
-                combined_results[var] = []
-
-        if not epoch_loaded:
-            self.logger.error("Gagal memuat epoch! Pastikan file CSV memiliki kolom 'epoch'.")
-            return {}
-
-        self.var = combined_results  # Simpan hasil ke self.var
-        self.logger.info("Data dari file CSV gabungan berhasil dikumpulkan.")
-        
-        return combined_results  # Pastikan fungsi mengembalikan dictionary yang valid
-
-    def smooth_curve(self, values, weight=0.9):
-        """Melakukan smoothing pada kurva untuk mengurangi noise."""
-        smoothed = []
-        last = values[0]
-        for point in values:
-            smoothed_val = last * weight + (1 - weight) * point
-            smoothed.append(smoothed_val)
-            last = smoothed_val
-        return smoothed
-    
-    def plot_combined(self, collected_combined):
-        """
-        Fungsi untuk membaca data dari file CSV gabungan menggunakan `collect_combined_data()`
-        dan melakukan plotting untuk setiap Fold dengan markers & colors yang berbeda.
-        """
-        # Ambil data terbaru dari file CSV gabungan
-        collected_combined = self.collect_combined_data()
-
-        # Pastikan collected_combined adalah dictionary yang valid
-        if not isinstance(collected_combined, dict):
-            self.logger.error("Data collected_combined tidak valid. Pastikan berupa dictionary.")
-            return
-
-        # Pastikan epoch tersedia
-        if "epoch" not in collected_combined or not collected_combined["epoch"]:
-            self.logger.error("Data epoch tidak ditemukan dalam collected_combined.")
-            return
-
-        epochs = collected_combined["epoch"]  # Ambil daftar epoch
-
-        # Definisi markers dan colors
-        markers = ['o', 's', 'D', '^', 'v']  # Marker untuk variasi visual tiap fold
-        colors = ['b', 'g', 'r', 'c', 'm']  # Warna berbeda untuk tiap fold
-
-        for var in self.variables:
-            if var not in collected_combined or not collected_combined[var]:
-                self.logger.error(f"Data {var} tidak tersedia atau kosong, dilewati.")
-                continue
-
-            # Pastikan data untuk variabel ini berbentuk DataFrame
-            data_dict = {"epoch": epochs}
-            fold_columns = [f"Fold_{i+1}" for i in range(len(collected_combined[var]))]
-
-            for i, fold_data in enumerate(collected_combined[var]):
-                data_dict[f"Fold_{i+1}"] = fold_data
-
-            df = pd.DataFrame(data_dict)
-
-            # Plot grafik untuk setiap Fold dengan marker dan warna yang berbeda
-            plt.figure(figsize=(8, 6))
-            for i, col in enumerate(fold_columns):
-                plt.plot(
-                    df["epoch"], df[col], 
-                    marker=markers[i % len(markers)],  # Rotasi marker jika fold > jumlah marker
-                    color=colors[i % len(colors)],    # Rotasi warna jika fold > jumlah warna
-                    linestyle='-', label=col
+                self._plot_curve(
+                    df["epoch"], {var: df[var]},
+                    title=f"{var} - Fold {fold}-{data}",
+                    ylabel=var,
+                    save_path=self.results_indt / f"{fold}_fold_Ind_{filename}.png"
                 )
 
-            # Konfigurasi plot
-            plt.xlabel("Epoch")
-            plt.ylabel(var)
-            plt.title(f"Training Loss / Metrics per Fold - {var}")
-            plt.legend()
-            plt.grid(True)
-
-            # Simpan hasil plot
-            save_path = Path(self.results_comp) / f"Cbd_{var.replace('/', '_')}.png"
-            plt.savefig(save_path, dpi=300)
-            plt.close()
-
-        self.logger.info("Comparison graphs have been saved successfully.")
-    
-    def plot_variable(self, var, collect_fold):
-        # Periksa apakah data tersedia
-        fold_data = collect_fold # ambil data dari function collect_fold_data
-
-        for fold , fold_values in fold_data.items():  # Loop untuk setiap fold
-            if not isinstance(fold_values, dict):
-                self.logger.error(f"Fold {fold}: Data fold bukan dictionary, mungkin format salah. Dilewati.")
-                continue
-            
-            if "epoch" not in self.var or var not in self.var:
-                self.logger.error(f"Data {var} atau epoch tidak ditemukan dalam fold_results.")
-                return
-            
-            epochs = fold_values["epoch"]  # Ambil semua epoch
-            values = fold_values[var] # Ambil nilai variabel untuk fold ini
-
-            # Pastikan values memiliki data yang valid
-            if not isinstance(values, list) or all(v is None for v in values):
-                self.logger.error(f"Fold {fold}: Data {var} tidak valid atau kosong, dilewati.")
-                continue
-                
-            # Pastikan panjang epoch dan values cocok
-            if len(epochs) != len(values):
-                self.logger.error(f"Skipping Fold {fold}: Mismatch (epochs: {len(epochs)}, values: {len(values)})")
-                continue
-
-            # Buat figure baru untuk setiap fold agar tidak tumpang tindih
-            plt.figure(figsize=(10, 5))
-            plt.plot(epochs, values, marker='o', linestyle='-', label=var)
-
-            plt.xlabel("Epoch")
-            plt.ylabel(var)
-            plt.title(f"Graph of {var} - Fold {fold}")
-            plt.legend()
-            plt.grid(True)
-
-            # Simpan hasil plot dengan nama berdasarkan fold
-            save_path = Path(self.results_indt) / f"{fold}_fold_Ind_{var.replace('/', '_')}.png"
-            save_path.parent.mkdir(parents=True, exist_ok=True)  # Pastikan folder ada
-            plt.savefig(save_path, dpi=300)
-            plt.close()  # Tutup plot untuk fold ini agar tidak menumpuk
-
-            self.logger.debug(f"Plot {var} untuk fold {fold} telah disimpan di {save_path}.")
-
-    def plot_all(self):
-        collect_fold = self.collect_fold_data()
-        collect_comb = self.collect_combined_data()
+    def plot_combined(self, data):
         for var in self.variables:
-            self.plot_variable(var, collect_fold)
-        self.plot_combined(collect_comb)
-        self.logger.debug("All Graphs have been saved successfully.")
+            filename = var.replace("/", "_")
+            filepath = self.file_path / "combined" / f"combined_{filename}.csv"
+            df = self._load_csv(filepath)
+            if df is None or "epoch" not in df:
+                continue
+            ys_dict = {col: df[col] for col in df.columns if col != "epoch"}
+            self._plot_curve(
+                df["epoch"], ys_dict,
+                f"Combined Fold - {data.upper()} - {var}", var,
+                self.results_comp / f"Cbd_{filename}.png",
+                use_style_variation=True
+            )
 
-class PredictionClassificator:
-    # class yang berisi command untuk membuat confusion matrix biner (klasifikasi)
-    def __init__(self, predictions_json, label_dir, olah_path, fold, data, model_type, size):
+    def plot_mean_curves(self, data):
+        for var in self.variables:
+            filename = var.replace("/", "_")
+            filepath = self.file_path / "combined" / f"mean_{filename}.csv"
+            df = self._load_csv(filepath)
+            if df is None or "epoch" not in df or "mean" not in df:
+                continue
+            self._plot_curve(
+                df["epoch"], {f"Mean-{var}": df["mean"]},
+                f"Mean Folds per Epoch - {data.upper()} - {var}", var,
+                self.results_comp / f"Mean_{filename}.png"
+            )
+
+    def plot_all(self, target_folds, data):
+        self.plot_variable(target_folds, data)
+        self.plot_combined(data)
+        self.plot_mean_curves(data)
+        self.logger.info("Semua grafik berhasil dibuat dan disimpan.")
+
+class ValidationDetector:
+    def __init__(self, predictions_json, label_dir, olah_path, log_path, fold, data, model_type, size):
         self.predictions_json = predictions_json / "train" / "predictions.json"
         self.label_dir = label_dir
         self.fold = fold
-        self.data = data # variabel untuk menampilkan / mendefinisikan jenis data
+        self.data = data
         self.model_type = model_type
         self.size = size
-        self.output_json = olah_path /self.model_type / f'ukuran_{self.size}'/ "json_final" # direktori json final untuk menjadi bahan confusion matrix klasifikasi
-        self.output_gt = olah_path /self.model_type / f'ukuran_{self.size}'/ "json_gt" # direktori untuk membuat file json ground truth dari file labels
-        self.output_pred = olah_path /self.model_type / f'ukuran_{self.size}'/ "json_pred" # direktori untuk membuat file json prediksi yang difiltrasi dari file mentah predictions.json 
-        self.output_cm = olah_path /self.model_type / f'ukuran_{self.size}'/ "cm" # direktori untuk membuat confusion matrix klasifikasi
-        # Pastikan folder json_gt dan cm ada
-        self.output_gt.mkdir(parents=True, exist_ok=True)
-        self.output_cm.mkdir(parents=True, exist_ok=True)
-        self.output_pred.mkdir(parents=True, exist_ok=True)
+        self.image_width, self.image_height = 640, 640
+        self.log_path = log_path / "log_val_det.txt"
+        self.logger = LoggerManager(log_file=self.log_path)
+
+        self.output_path = olah_path / model_type / f"ukuran_{size}" / "hasil_csv"
+        self.output_json = olah_path / model_type / f"ukuran_{size}" / "json_final"
+        self.output_gt = olah_path / model_type / f"ukuran_{size}" / "json_gt_deteksi"
+        self.output_cm_d = olah_path / model_type / f"ukuran_{size}" / "cm_deteksi"
         self.output_json.mkdir(parents=True, exist_ok=True)
-        self.matched_data = []
-        # Dictionary mapping kategori prediksi ke nilai yang benar
-        self.valid_labels = {
-            0 : "bercak cokelat",
-            1 : "bercak cokelat tipis",
-            2 : "blas daun",
-            3 : "lepuh daun",
-            4 : "hawar daun bakteri",
-            5 : "sehat"
-        }
-        self.label_mapping = {
-            1: 0,  # bercak cokelat
-            2: 1,  # bercak cokelat tipis
-            3: 2,  # blas daun
-            4: 3,  # lepuh daun
-            5: 4,  # hawar daun bakteri
-            6: 5   # sehat
-        }
-        self.logger = LoggerManager(log_file=self.output_json / "log_cm.txt")
-
-    def load_gt_labels(self):
-        ground_truth = {}
-
-        if not os.path.exists(self.label_dir):
-            self.logger.error(f"Direktori label {self.label_dir} tidak ditemukan.")
-            return ground_truth
-
-        for label_file in os.listdir(self.label_dir):
-            try:
-                image_id = os.path.splitext(label_file)[0]
-                label_path = os.path.join(self.label_dir, label_file)
-
-                with open(label_path, "r") as f:
-                    gt_bboxes = []
-                    gt_classes = []
-                    for line in f.readlines():
-                        parts = line.strip().split()
-                        class_id = int(parts[0])
-                        bbox = list(map(float, parts[1:5]))
-                        gt_classes.append(class_id)
-                        gt_bboxes.append(bbox)
-
-                    ground_truth[image_id] = {
-                        "true_classes": gt_classes,
-                        "true_bboxes": gt_bboxes
-                    }
-            except Exception as e:
-                self.logger.error(f"Kesalahan saat memproses {label_file}: {e}")
-                continue
-
-        # Simpan ground truth ke file JSON dengan nama berdasarkan fold
-        gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
-        try:
-            with open(gt_json_path, "w") as f:
-                json.dump(ground_truth, f, indent=4)
-            self.logger.info(f"Label ground truth berhasil disimpan di {gt_json_path}")
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan ground truth ke JSON: {e}")
-        
-        return ground_truth
-
-    def filter_predictions(self):
-
-        if not self.predictions_json.exists():
-            print(f"File prediksi {self.predictions_json} tidak ditemukan.")
-            return
-        
-        with open(self.predictions_json, "r") as f:
-            data = json.load(f)
-
-        unique_data = {}
-        for item in data:
-            image_id = item.get("image_id")
-            pred_label = self.label_mapping.get(item.get("category_id"), item.get("category_id"))  # Mapping label
-            bbox = item.get("bbox", [])
-
-            if pred_label is None:
-                self.logger.error(f"Data tanpa category_id ditemukan: {item}")  # Tambahkan logging
-                continue
-            
-            if pred_label in self.valid_labels:
-                if image_id not in unique_data or len(bbox) > len(unique_data[image_id]["bbox"]):
-                    unique_data[image_id] = {
-                        "image_id": image_id,
-                        "pred_label": pred_label,
-                        "bbox": bbox
-                    }
-        
-        filtered_json_path = self.output_pred / f"fold_{self.fold}_filtered.json"
-        with open(filtered_json_path, 'w') as f:
-            json.dump(list(unique_data.values()), f, indent=4)
-        self.logger.info(f"Filtered data saved to {filtered_json_path}")
-
-    def match_pred_with_gt(self):
-        filtered_json_path = self.output_pred /  f"fold_{self.fold}_filtered.json"
-        
-        if not filtered_json_path.exists():
-            print(f"File prediksi yang telah difilter tidak ditemukan: {filtered_json_path}")
-            return
-
-        try:
-            with open(filtered_json_path, "r") as f:
-                predictions = json.load(f)
-                
-            gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
-            if gt_json_path.exists():
-                with open(gt_json_path, "r") as f:
-                    ground_truth = json.load(f)
-                self.logger.info(f"Ground truth dimuat dari {gt_json_path}")
-            else:
-                ground_truth = self.load_gt_labels()
-            
-            for pred in predictions:
-                image_id = str(pred["image_id"])
-                pred_class = pred["pred_label"]  # Pastikan sesuai dengan format dari filter_predictions()
-                
-                if image_id in ground_truth:
-                    true_labels = list(set(ground_truth[image_id]["true_classes"]))  # Hapus duplikasi
-                    
-                    if not any(d["image_id"] == image_id for d in self.matched_data):  
-                        self.matched_data.append({
-                            "image_id": image_id,
-                            "true_label": true_labels,
-                            "pred_label": [pred_class],
-                        })
-            
-            self.save_matched_predictions()
-        except Exception as e:
-            self.logger.error(f"Kesalahan saat matching prediksi: {e}")
-    
-    def save_matched_predictions(self):
-        output_json_path = self.output_json / f"fold_{self.fold}_matched.json"
-        
-        try:
-            self.output_json.mkdir(parents=True, exist_ok=True)
-            with open(output_json_path, "w") as f:
-                json.dump(self.matched_data, f, indent=4)
-            self.logger.info(f"Hasil pencocokan disimpan di {output_json_path}")
-            
-            # Setelah menyimpan, buat confusion matrix
-            self.compute_confusion_matrix(output_json_path)
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan hasil ke {output_json_path}: {e}")
-    
-    def compute_confusion_matrix(self, matched_json_path):
-        """ Membuat dan menyimpan confusion matrix berdasarkan data yang telah dicocokkan. """
-        try:
-            with open(matched_json_path, "r") as f:
-                matched_data = json.load(f)
-            
-            # Pastikan true_labels dan pred_labels diambil dengan format yang benar
-            true_labels = []
-            pred_labels = []
-
-            for item in matched_data:
-                # Cek apakah "true_label" ada dan dalam bentuk yang benar
-                if isinstance(item["true_label"], list) and len(item["true_label"]) > 0:
-                    true_labels.append(item["true_label"][0])  # Ambil elemen pertama jika berbentuk list
-                elif isinstance(item["true_label"], int):  # Jika bukan list, langsung tambahkan
-                    true_labels.append(item["true_label"])
-                else:
-                    self.logger.error(f"Format tidak valid di true_label: {item['true_label']}")
-
-                # Cek apakah "pred_label" ada dan dalam bentuk yang benar
-                if isinstance(item["pred_label"], list) and len(item["pred_label"]) > 0:
-                    pred_labels.append(item["pred_label"][0])  # Ambil elemen pertama jika berbentuk list
-                elif isinstance(item["pred_label"], int):
-                    pred_labels.append(item["pred_label"])
-                else:
-                    self.logger.error(f"Format tidak valid di pred_label: {item['pred_label']}")
-
-            # Pastikan panjang kedua label sama sebelum membuat confusion matrix
-            if len(true_labels) == 0 or len(pred_labels) == 0:
-                self.logger.error("Gagal membuat confusion matrix: Tidak ada data label yang valid.")
-                return
-
-            if len(true_labels) != len(pred_labels):
-                self.logger.error(f"Gagal membuat confusion matrix: Ukuran true_labels ({len(true_labels)}) dan pred_labels ({len(pred_labels)}) tidak sama.")
-                return
-            cm = confusion_matrix(true_labels, pred_labels, labels=list(self.valid_labels.keys()))
-            cm_labels = [self.valid_labels[i] for i in self.valid_labels.keys()]
-            cm_path = self.output_cm / f"fold_{self.fold}_cm.png"
-            
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Oranges", xticklabels=cm_labels, yticklabels=cm_labels)
-            plt.xlabel("Predicted Label")
-            plt.ylabel("True Label")
-            plt.title(f"Confusion Matrix Klasifikasi {self.data}- Fold {self.fold}")
-            plt.savefig(cm_path)
-            plt.close()
-            
-            self.logger.info(f"Confusion matrix disimpan di {cm_path}")
-
-        except Exception as e:
-            self.logger.error(f"Kesalahan saat membuat confusion matrix: {e}")
-
-class PredictionDetector:
-    # Class yang berisi command untuk membuat confusion matrix multi-kelas (deteksi objek)
-    def __init__(self, predictions_json, label_dir, olah_path, fold, data, model_type, size):
-        self.predictions_json = predictions_json / "train" / "predictions.json"
-        self.label_dir = label_dir
-        self.fold = fold
-        self.data = data # variabel untuk menampilkan / mendefinisikan jenis data
-        self.model_type = model_type
-        self.size = size
-        self.output_path  = olah_path /self.model_type / f'ukuran_{self.size}'/ "hasil_csv"
-        self.output_json = olah_path /self.model_type / f'ukuran_{self.size}' / "json_final" # direktori json final untuk menjadi bahan confusion matrix deteksi 
-        self.output_gt = olah_path /self.model_type / f'ukuran_{self.size}' / "json_gt_deteksi" # direktori untuk membuat file json ground truth dari file labels (untuk deteksi)
-        self.output_pred = olah_path /self.model_type / f'ukuran_{self.size}' / "json_pred" # direktori untuk membuat file json prediksi yang difiltrasi dari file mentah predictions.json ( ini juga tidak perlu)
-        self.output_cm_d = olah_path /self.model_type / f'ukuran_{self.size}' / "cm_deteksi" # direktori untuk membuat confusion matrix multi-kelas (deteksi)
-        # Pastikan folder json_gt dan cm ada
         self.output_gt.mkdir(parents=True, exist_ok=True)
         self.output_cm_d.mkdir(parents=True, exist_ok=True)
-        self.output_pred.mkdir(parents=True, exist_ok=True)
-        self.output_json.mkdir(parents=True, exist_ok=True)
-        self.matched_data = []
-        # Dictionary mapping kategori prediksi ke nilai yang benar
+
         self.valid_labels = {
-            0 : "bercak cokelat",
-            1 : "bercak cokelat tipis",
-            2 : "blas daun",
-            3 : "lepuh daun",
-            4 : "hawar daun bakteri",
-            5 : "sehat"
+            0: "bercak cokelat",
+            1: "bercak cokelat tipis",
+            2: "blas daun",
+            3: "lepuh daun",
+            4: "hawar daun bakteri",
+            5: "sehat"
         }
-        self.label_mapping = {
-            1: 0,  # bercak cokelat
-            2: 1,  # bercak cokelat tipis
-            3: 2,  # blas daun
-            4: 3,  # lepuh daun
-            5: 4,  # hawar daun bakteri
-            6: 5   # sehat
-        }
-        self.logger = LoggerManager(log_file=self.output_json / "log_cm_deteksi.txt")
+        self.label_mapping = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
 
-    def load_gt_labels(self):
+    def compute_iou(self, box1, box2):
+        x1_min, y1_min = box1[0], box1[1]
+        x1_max = x1_min + box1[2]
+        y1_max = y1_min + box1[3]
+        x2_min, y2_min = box2[0], box2[1]
+        x2_max = x2_min + box2[2]
+        y2_max = y2_min + box2[3]
+
+        inter_xmin = max(x1_min, x2_min)
+        inter_ymin = max(y1_min, y2_min)
+        inter_xmax = min(x1_max, x2_max)
+        inter_ymax = min(y1_max, y2_max)
+
+        inter_area = max(0, inter_xmax - inter_xmin) * max(0, inter_ymax - inter_ymin)
+        area1 = box1[2] * box1[3]
+        area2 = box2[2] * box2[3]
+        union_area = area1 + area2 - inter_area
+
+        return inter_area / union_area if union_area > 0 else 0.0
+
+    def _nms(self, pred_boxes, scores, classes, iou_threshold):
+        """Non-Maximum Suppression (NMS) untuk satu gambar"""
+        if not pred_boxes:
+            return [], [], []
+
+        boxes = np.array(pred_boxes)
+        scores = np.array(scores)
+        classes = np.array(classes)
+
+        indices = scores.argsort()[::-1]
+        keep_boxes, keep_scores, keep_classes = [], [], []
+
+        while len(indices) > 0:
+            current = indices[0]
+            keep_boxes.append(pred_boxes[current])
+            keep_scores.append(scores[current])
+            keep_classes.append(classes[current])
+
+            rest_indices = indices[1:]
+            rest_boxes = [pred_boxes[i] for i in rest_indices]
+            ious = [self.compute_iou(pred_boxes[current], box) for box in rest_boxes ]
+            indices = [i for i, iou in zip(rest_indices, ious) if iou < iou_threshold]
+
+        return keep_boxes, keep_scores, keep_classes
+    
+    def _load_gt(self):
+        gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
+        if gt_json_path.exists():
+            with open(gt_json_path, "r") as f:
+                return json.load(f)
+
         ground_truth = {}
-
         if not os.path.exists(self.label_dir):
-            self.logger.error(f"Direktori label {self.label_dir} tidak ditemukan.")
-            return ground_truth
+            raise FileNotFoundError(f"Label directory not found: {self.label_dir}")
 
         for label_file in os.listdir(self.label_dir):
-            try:
-                image_id = os.path.splitext(label_file)[0]
-                label_path = os.path.join(self.label_dir, label_file)
+            image_id = os.path.splitext(label_file)[0].strip()
+            with open(os.path.join(self.label_dir, label_file), "r") as f:
+                classes, bboxes = [], []
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        continue
+                    cls = int(parts[0])
+                    xc, yc, w, h = map(float, parts[1:5])
+                    x_min = (xc - w / 2) * self.image_width
+                    y_min = (yc - h / 2) * self.image_height
+                    w_px = w * self.image_width
+                    h_px = h * self.image_height
+                    coco_bbox = [x_min, y_min, w_px, h_px]
+                    classes.append(cls)
+                    bboxes.append(coco_bbox)
 
-                with open(label_path, "r") as f:
-                    gt_bboxes = []
-                    gt_classes = []
-                    for line in f.readlines():
-                        parts = line.strip().split()
-                        class_id = int(parts[0])
-                        bbox = list(map(float, parts[1:5]))
-                        gt_classes.append(class_id)
-                        gt_bboxes.append(bbox)
+            ground_truth[image_id] = {"true_classes": classes, "true_bboxes": bboxes}
 
-                    ground_truth[image_id] = {
-                        "true_classes": gt_classes,
-                        "true_bboxes": gt_bboxes
-                    }
-            except Exception as e:
-                self.logger.error(f"Kesalahan saat memproses {label_file}: {e}")
+        with open(gt_json_path, "w") as f:
+            json.dump(ground_truth, f, indent=4)
+
+        return ground_truth
+
+    def generate_matched_json(self, iou_threshold :float, score_threshold : float):
+        # 1. Load raw predictions
+        with open(self.predictions_json, "r") as f:
+            raw_preds = json.load(f)
+
+        # 2. Map ke format internal
+        predictions = [
+            {
+                "image_id": str(item["image_id"]).strip(),
+                "pred_label": self.label_mapping.get(item["category_id"], item["category_id"]),
+                "bbox": item["bbox"],
+                "score": item.get("score", 1.0)
+            }
+            for item in raw_preds
+        ]
+
+        # 3. Load ground truth
+        ground_truth = self._load_gt()
+
+        # 4. Kelompokkan prediksi per image & apply confidence threshold
+        pred_by_image = defaultdict(list)
+        for p in predictions:
+            if p["score"] >= score_threshold:
+                pred_by_image[p["image_id"]].append(p)
+
+        # 5. Proses matching + NMS + statistik
+        matched_data = {}
+        total_gt = total_pred = total_matched_gt = unmatched_gts = unmatched_preds = 0
+
+        # Hitung GT per image, lakukan NMS, hitung TP
+        for image_id, gt in ground_truth.items():
+            true_classes = gt["true_classes"]
+            true_bboxes = gt["true_bboxes"]
+            total_gt += len(true_bboxes)
+
+            preds = pred_by_image.get(image_id, [])
+            if not preds:
+                unmatched_gts += 1
+                self.logger.info(f"[UNMATCHED GT] {image_id}: {len(true_bboxes)} GT bbox, no predictions.")
+                matched_data[image_id] = {
+                    "true_classes": true_classes,
+                    "true_bboxes": true_bboxes,
+                    "pred_classes": [],
+                    "pred_bboxes": [],
+                    "scores": [],
+                }
                 continue
 
-        # Simpan ground truth ke file JSON dengan nama berdasarkan fold
-        gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
-        try:
-            with open(gt_json_path, "w") as f:
-                json.dump(ground_truth, f, indent=4)
-            self.logger.info(f"Label ground truth berhasil disimpan di {gt_json_path}")
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan ground truth ke JSON: {e}")
-        
-        return ground_truth
-    
-    def compute_iou(self,box1, box2):
-        """
-        Menghitung IoU (Intersection over Union) antara dua bbox format [x, y, w, h]
-        """
-        x1_min = box1[0]
-        y1_min = box1[1]
-        x1_max = box1[0] + box1[2]
-        y1_max = box1[1] + box1[3]
+            # Extract lists
+            boxes  = [p["bbox"] for p in preds]
+            scores = [p["score"] for p in preds]
+            labs   = [p["pred_label"] for p in preds]
 
-        x2_min = box2[0]
-        y2_min = box2[1]
-        x2_max = box2[0] + box2[2]
-        y2_max = box2[1] + box2[3]
+            # NMS
+            nms_boxes, nms_scores_np, nms_labels_np = self._nms(boxes, scores, labs, iou_threshold)
+            # Cast scores & labels ke Python float/int
+            nms_scores = [float(s) for s in nms_scores_np]
+            nms_labels = [int(l)   for l in nms_labels_np]
+            total_pred += len(nms_boxes)
+
+            # Hitung GT yang terdeteksi (TP)
+            matched_idxs = set()
+            for gt_idx, gt_box in enumerate(true_bboxes):
+                for pred_box in nms_boxes:
+                    if self.compute_iou(gt_box, pred_box) >= iou_threshold:
+                        matched_idxs.add(gt_idx)
+                        break
+            total_matched_gt += len(matched_idxs)
+
+            matched_data[image_id] = {
+                "true_classes": true_classes,
+                "true_bboxes": true_bboxes,
+                "pred_classes": nms_labels,
+                "pred_bboxes": nms_boxes,
+                "scores": nms_scores,
+            }
+
+        # Prediksi tanpa GT
+        for image_id in pred_by_image:
+            if image_id not in ground_truth:
+                unmatched_preds += 1
+                self.logger.error(f"[UNMATCHED PREDICTION] image_id '{image_id}' not in GT.")
+
+        # Logging statistik
+        total_missed = total_gt - total_matched_gt
+        self.logger.info("\n[STATISTIK MATCHED JSON - VALIDASI]")
+        self.logger.info(f"Total GT BBoxes       : {total_gt}")
+        self.logger.info(f"Total Prediksi BBoxes : {total_pred}")
+        self.logger.info(f"GT yang Terdeteksi    : {total_matched_gt}")
+        self.logger.info(f"GT Tidak Terdeteksi   : {total_missed}")
+        self.logger.info(f"Total Image matched   : {len(matched_data)}")
+        self.logger.info(f"Image tanpa prediksi  : {unmatched_gts}")
+        self.logger.info(f"Prediksi di luar GT   : {unmatched_preds}")
+
+        # 6. Simpan matched_data ke JSON (tanpa statistik)
+        out_json = self.output_json / f"fold_{self.fold}_matched.json"
+        with open(out_json, "w") as f:
+            json.dump(matched_data, f, indent=4)
+
+        self.logger.info(f"\nFile Matched Json tersimpan di path: {out_json}")
+        return out_json
+    
+    def generate_confusion_matrix(self, iou_threshold, score_threshold):
+        matched_path = self.output_json / f"fold_{self.fold}_matched.json"
+        with open(matched_path, "r") as f:
+            matched_data = json.load(f)
+
+        y_true, y_pred = [], []
+        matched_pairs = set()
+
+        for image_id, data in matched_data.items():
+            gt_classes = data.get("true_classes", [])
+            gt_bboxes = data.get("true_bboxes", [])
+            pred_classes = data.get("pred_classes", [])
+            pred_bboxes = data.get("pred_bboxes", [])
+            scores = data.get("scores", [])
+
+            used_pred = set()
+
+            for i, (gt_cls, gt_box) in enumerate(zip(gt_classes, gt_bboxes)):
+                best_iou = 0
+                best_j = -1
+                for j, (pred_cls, pred_box, score) in enumerate(zip(pred_classes, pred_bboxes, scores)):
+                    if j in used_pred or score < score_threshold:
+                        continue
+                    iou = self.compute_iou(gt_box, pred_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_j = j
+                if best_iou >= iou_threshold and best_j != -1:
+                    y_true.append(gt_cls)
+                    y_pred.append(pred_classes[best_j])
+                    used_pred.add(best_j)
+                    matched_pairs.add((image_id, best_j))
+                else:
+                    y_true.append(gt_cls)
+                    y_pred.append("no pred")
+
+            for j, (pred_cls, score) in enumerate(zip(pred_classes, scores)):
+                if j not in used_pred and score >= score_threshold:
+                    y_true.append("no gt")
+                    y_pred.append(pred_cls)
+
+        # Confusion matrix
+        label_ids = list(self.valid_labels.keys())
+        display_names = [self.valid_labels[i] for i in label_ids] + ["no pred", "no gt"]
+        cm_labels = label_ids + ["no pred", "no gt"]
+
+        cm = confusion_matrix(y_true, y_pred, labels=cm_labels)
+
+        # Plot
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm.T, annot=True, fmt='d', cmap='Greens',
+                    xticklabels=display_names, yticklabels=display_names,
+                    cbar=True, square=True, linewidths=.5)
+        plt.title(f"Confusion Matrix Multi-Kelas Data Validasi - Fold-{self.fold}-{self.data.upper()}", fontsize=13)
+        plt.xlabel("True Labels", fontsize=12)
+        plt.ylabel("Predicted Labels", fontsize=12)
+        plt.xticks(rotation=90, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout(pad=2.5)
+
+        output_cm = self.output_cm_d / f"fold_{self.fold}_cm.png"
+        plt.savefig(output_cm, format="png", dpi=300)
+        self.logger.info(f"[INFO] Confusion Matrix saved to: {output_cm}")
+
+class PredictionDetector:
+    def __init__(self, label_hasil, label_awal, olah_path, log_path, size, model_type, data, fold, engine):
+        self.label_hasil = label_hasil
+        self.label_awal = label_awal / "labels"
+        self.size = size
+        self.model_type = model_type
+        self.engine = engine
+        self.data = data
+        self.fold = fold
+        self.log_path = log_path / "log_uji_det.txt"
+        self.logger = LoggerManager(log_file=self.log_path)
+        self.output_json_hasil = olah_path / model_type / f"ukuran_{size}" / "json_hasil_uji"
+        self.output_json_awal = olah_path / model_type / f"ukuran_{size}" /"json_gt_deteksi"
+        self.json_matched = olah_path / model_type / f"ukuran_{size}" / "json_matched_uji"
+        self.cm_uji = olah_path / model_type / f"ukuran_{size}" / "cm_deteksi_uji"
+        self.output_json_hasil.mkdir(parents=True, exist_ok=True)
+        self.json_matched.mkdir(parents=True, exist_ok=True)
+        self.cm_uji.mkdir(parents=True, exist_ok=True)
+        self.image_width, self.image_height = 640, 640
+        self.valid_labels = {
+            0: "bercak cokelat",
+            1: "bercak cokelat tipis",
+            2: "blas daun",
+            3: "lepuh daun",
+            4: "hawar daun bakteri",
+            5: "sehat"
+        }
+        self.label_mapping = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+
+    def compute_iou(self, box1, box2):
+        x1_min, y1_min = box1[0], box1[1]
+        x1_max = x1_min + box1[2]
+        y1_max = y1_min + box1[3]
+        x2_min, y2_min = box2[0], box2[1]
+        x2_max = x2_min + box2[2]
+        y2_max = y2_min + box2[3]
 
         inter_xmin = max(x1_min, x2_min)
         inter_ymin = max(y1_min, y2_min)
@@ -775,351 +635,380 @@ class PredictionDetector:
 
         return inter_area / union_area if union_area > 0 else 0.0
     
-    def log_detection_statistics(self, matched_data, title=""):
-        """
-        Logging jumlah TP, FP, FN per kelas berdasarkan matched_data,
-        dengan nama kelas dari self.valid_labels.
-        Hasil juga disimpan ke file CSV.
-        """
+    def compute_ap(self, recall, precision):
+        """Menghitung area under PR curve (COCO style)."""
+        return auc(recall, precision)
+    
+    def _nms(self, pred_boxes, scores, classes, iou_threshold):
+        """Non-Maximum Suppression (NMS) untuk satu gambar"""
+        if not pred_boxes:
+            return [], [], []
 
-        stats = {
-            "TP": defaultdict(int),
-            "FP": defaultdict(int),
-            "FN": defaultdict(int),
-        }
+        boxes = np.array(pred_boxes)
+        scores = np.array(scores)
+        classes = np.array(classes)
 
-        for item in matched_data:
-            true = item.get("true_label")
-            pred = item.get("pred_label")
+        indices = scores.argsort()[::-1]
+        keep_boxes, keep_scores, keep_classes = [], [], []
 
-            if true is not None and pred is not None:
-                if true == pred:
-                    stats["TP"][true] += 1
-                else:
-                    stats["FP"][pred] += 1
-                    stats["FN"][true] += 1
-            elif true is None and pred is not None:
-                stats["FP"][pred] += 1
-            elif true is not None and pred is None:
-                stats["FN"][true] += 1
+        while len(indices) > 0:
+            current = indices[0]
+            keep_boxes.append(pred_boxes[current])
+            keep_scores.append(scores[current])
+            keep_classes.append(classes[current])
 
-        self.logger.info(f"==== Statistik Evaluasi Deteksi: {title} ====")
-        all_labels = sorted(set(list(stats["TP"].keys()) + list(stats["FP"].keys()) + list(stats["FN"].keys())))
+            rest_indices = indices[1:]
+            rest_boxes = [pred_boxes[i] for i in rest_indices]
+            ious = [self.compute_iou(pred_boxes[current], box) for box in rest_boxes ]
+            indices = [i for i, iou in zip(rest_indices, ious) if iou < iou_threshold]
 
-        csv_rows = []
-        for label in all_labels:
-            label_name = self.valid_labels.get(label, f"Unknown ({label})")
-            tp = stats["TP"].get(label, 0)
-            fp = stats["FP"].get(label, 0)
-            fn = stats["FN"].get(label, 0)
-            self.logger.info(f"Kelas '{label_name}': TP={tp}, FP={fp}, FN={fn}")
+        return keep_boxes, keep_scores, keep_classes
 
-            csv_rows.append({
-                "kelas_id": label,
-                "kelas_nama": label_name,
-                "TP": tp,
-                "FP": fp,
-                "FN": fn
-            })
+    def _load_gt(self):
+        gt_json_path = self.output_json_awal / f"uji_awal_labels.json"
+        if gt_json_path.exists():
+            with open(gt_json_path, "r") as f:
+                return json.load(f)
 
-        # Simpan ke CSV
-        csv_output_path = self.output_path / f"fold_{self.fold}_stats_{title.replace(' ', '_').lower()}.csv"
-        try:
-            with open(csv_output_path, mode="w", newline='', encoding="utf-8") as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=["kelas_id", "kelas_nama", "TP", "FP", "FN"])
-                writer.writeheader()
-                writer.writerows(csv_rows)
-            self.logger.info(f"Statistik deteksi disimpan ke {csv_output_path}")
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan statistik ke CSV: {e}")
+        ground_truth = {}
+        if not os.path.exists(self.label_awal):
+            raise FileNotFoundError(f"Label directory not found: {self.label_awal}")
 
-    # Melakukan pembuatan Confusion Matrix dengan Score
-    def match_pred_with_gt(self, score_threshold, iou_threshold):
-        """
-        Pencocokan prediksi dengan ground truth multi-kelas menggunakan confidence score dan IoU.
-        """
-        if not self.predictions_json.exists():
-            self.logger.error(f"File prediksi tidak ditemukan: {self.predictions_json}")
-            return
+        for label_file in os.listdir(self.label_awal):
+            image_id = os.path.splitext(label_file)[0].strip()
+            with open(os.path.join(self.label_awal, label_file), "r") as f:
+                classes, bboxes = [], []
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        continue
+                    cls = int(parts[0])
+                    xc, yc, w, h = map(float, parts[1:5])
+                    x_min = (xc - w / 2) * self.image_width
+                    y_min = (yc - h / 2) * self.image_height
+                    w_px = w * self.image_width
+                    h_px = h * self.image_height
+                    coco_bbox = [x_min, y_min, w_px, h_px]
+                    classes.append(cls)
+                    bboxes.append(coco_bbox)
 
-        try:
-            with open(self.predictions_json, "r") as f:
-                predictions = json.load(f)
+            ground_truth[image_id] = {"true_classes": classes, "true_bboxes": bboxes}
 
-            gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
-            if gt_json_path.exists():
-                with open(gt_json_path, "r") as f:
-                    ground_truth = json.load(f)
-                self.logger.info(f"Ground truth dimuat dari {gt_json_path}")
+        with open(gt_json_path, "w") as f:
+            json.dump(ground_truth, f, indent=4)
+
+        return ground_truth
+    
+    def _load_pred(self):
+        pred_json_path = self.output_json_hasil / f"{self.engine}_fold_{self.fold}_hasil_uji_labels.json"
+        if pred_json_path.exists():
+            with open(pred_json_path, "r") as f:
+                return json.load(f)
+        
+        self.logger.info(f"\nPath Label Data Uji yang dijalankan yakni : {self.label_hasil} \n")
+
+        if not os.path.exists(self.label_hasil):
+            raise FileNotFoundError(f"Label directory not found: {self.label_hasil}")
+
+        predictions = {}
+        for label_file in os.listdir(self.label_hasil):
+            image_id = os.path.splitext(label_file)[0].strip()
+            classes, bboxes, scores = [], [], []
+            with open(os.path.join(self.label_hasil, label_file), "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 6:
+                        continue
+                    cls = int(parts[0])
+                    xc, yc, w, h, score = map(float, parts[1:])
+
+                    # Konversi ke format [x_min, y_min, width, height] (COCO style)
+                    x_min = (xc - w / 2) * self.image_width
+                    y_min = (yc - h / 2) * self.image_height
+                    w_px = w * self.image_width
+                    h_px = h * self.image_height
+                    coco_bbox = [x_min, y_min, w_px, h_px]
+                    classes.append(cls)
+                    bboxes.append(coco_bbox)
+                    scores.append(score)
+
+            predictions[image_id] = {
+                "pred_classes": classes, 
+                "pred_bboxes": bboxes, 
+                "scores": scores}
+
+        with open(pred_json_path, "w") as f:
+            json.dump(predictions, f, indent=4)
+
+        self.logger.info(f"\nfile JSON Prediksi dari Data Uji path: {pred_json_path} berhasil didapatkan !")
+
+        return predictions
+    
+    def _load_matched(self, output_path, score_threshold, iou_threshold):
+        gt_data = self._load_gt()
+        pred_data = self._load_pred()
+
+        matched = {}
+        total_gt = total_pred = total_matched_gt = 0
+
+        for image_id in sorted(set(gt_data) | set(pred_data)):
+            gt_info    = gt_data.get(image_id, {})
+            true_cls   = gt_info.get("true_classes", [])
+            true_boxes = gt_info.get("true_bboxes", [])
+            total_gt  += len(true_boxes)
+
+            pred_info  = pred_data.get(image_id, {})
+            raw_boxes  = pred_info.get("pred_bboxes", [])
+            raw_scores = pred_info.get("scores", [])
+            raw_cls    = pred_info.get("pred_classes", [])
+
+            # 1) Confidence filtering
+            filtered = [
+                (b, s, c) for b, s, c in zip(raw_boxes, raw_scores, raw_cls)
+                if s >= score_threshold
+            ]
+
+            # 2) NMS
+            if filtered:
+                boxes, scores, cls = zip(*filtered)
+                nms_boxes, nms_scores_np, nms_cls_np = self._nms(boxes, scores, cls, iou_threshold)
+                # Cast to Python types
+                nms_scores = [float(s) for s in nms_scores_np]
+                nms_cls    = [int(c)   for c in nms_cls_np]
             else:
-                ground_truth = self.load_gt_labels()
+                nms_boxes, nms_scores, nms_cls = [], [], []
 
-            self.matched_data = []
+            total_pred += len(nms_boxes)
 
-            for pred in predictions:
-                if pred["score"] < score_threshold:
-                    continue
+            # 3) Hitung GT yang terdeteksi
+            matched_idxs = set()
+            for idx, gt_box in enumerate(true_boxes):
+                for pbox in nms_boxes:
+                    if self.compute_iou(gt_box, pbox) >= iou_threshold:
+                        matched_idxs.add(idx)
+                        break
+            total_matched_gt += len(matched_idxs)
 
-                image_id = str(pred["image_id"])
-                pred_class = self.label_mapping.get(pred["category_id"], pred["category_id"])
-                pred_bbox = pred["bbox"]
-                pred_score = pred["score"]
+            matched[image_id] = {
+                "true_classes": true_cls,
+                "true_bboxes":  true_boxes,
+                "pred_classes": nms_cls,
+                "pred_bboxes":  nms_boxes,
+                "scores":       nms_scores,
+            }
 
-                if image_id not in ground_truth:
-                    continue
+        # 4) Tulis ke JSON
+        with open(output_path, "w") as f:
+            json.dump(matched, f, indent=4)
 
-                gt_classes = ground_truth[image_id]["true_classes"]
-                gt_bboxes = ground_truth[image_id]["true_bboxes"]
+        # 5) Logging statistik
+        total_missed = total_gt - total_matched_gt
+        self.logger.info("\n[STATISTIK MATCHED JSON]")
+        self.logger.info(f"Total GT BBoxes       : {total_gt}")
+        self.logger.info(f"Total Prediksi BBoxes : {total_pred}")
+        self.logger.info(f"GT yang Terdeteksi    : {total_matched_gt}")
+        self.logger.info(f"GT Tidak Terdeteksi   : {total_missed}")
+        self.logger.info(f"File JSON gabungan tersimpan di path: {output_path}.\n")
 
+        return output_path
+
+    def generate_json(self, score_threshold, iou_threshold, output_path):
+        self.logger.info(f"\nGenerating matched JSON dengan threshold confidence score = {score_threshold} dan IoU = {iou_threshold}...")
+
+        # Muat GT dan Prediksi
+        self._load_gt()
+        self._load_pred()
+
+        # Lakukan pencocokan dan simpan hasil
+        matched = self._load_matched(
+            score_threshold=score_threshold,
+            iou_threshold=iou_threshold,
+            output_path=output_path)
+        self.logger.info("\nFile JSON untuk Label Data Awal dan Data Hasil sudah dibuat !!")
+
+        return matched
+
+    def generate_cm(self, matched_json_path, iou_threshold, score_threshold):
+        with open(matched_json_path, "r") as f:
+            matched_data = json.load(f)
+
+        matched_pairs = set()
+        y_true, y_pred = [], []
+
+        # Gunakan prediksi terbaik per gambar jika diaktifkan
+        for image_id, data in matched_data.items():
+            gt_classes = data.get("true_classes", [])
+            gt_bboxes = data.get("true_bboxes", [])
+            pred_classes = data.get("pred_classes", [])
+            pred_bboxes = data.get("pred_bboxes", [])
+            scores = data.get("scores", [])
+
+            used_pred = set()
+
+            for i, (gt_cls, gt_box) in enumerate(zip(gt_classes, gt_bboxes)):
                 best_iou = 0
-                best_idx = -1
-                for idx, gt_bbox in enumerate(gt_bboxes):
-                    iou = self.compute_iou(pred_bbox, gt_bbox)
+                best_j = -1
+                for j, (pred_cls, pred_box, score) in enumerate(zip(pred_classes, pred_bboxes, scores)):
+                    if j in used_pred or score < score_threshold:
+                        continue
+                    iou = self.compute_iou(gt_box, pred_box)
                     if iou > best_iou:
                         best_iou = iou
-                        best_idx = idx
+                        best_j = j
+                if best_iou >= iou_threshold and best_j != -1:
+                    y_true.append(gt_cls)
+                    y_pred.append(pred_classes[best_j])
+                    used_pred.add(best_j)
+                    matched_pairs.add((image_id, best_j))
+                else:
+                    y_true.append(gt_cls)
+                    y_pred.append("no pred")
 
-                if best_iou >= iou_threshold:
-                    gt_class = gt_classes[best_idx]
-                    self.matched_data.append({
-                        "image_id": image_id,
-                        "true_label": gt_class,
-                        "pred_label": pred_class,
-                        "score": pred_score,
-                        "iou": best_iou
-                    })
+            # Tambahkan false positive dari prediksi tidak match (score valid)
+            for j, (pred_cls, score) in enumerate(zip(pred_classes, scores)):
+                if j not in used_pred and score >= score_threshold:
+                    y_true.append("no gt")
+                    y_pred.append(pred_cls)
 
-            self.save_matched_predictions()
+        # Susun label untuk confusion matrix
+        label_ids = list(self.valid_labels.keys())
+        display_names = [self.valid_labels[i] for i in label_ids] + ["no pred", "no gt"]
+        cm_labels = label_ids + ["no pred", "no gt"]
 
-        except Exception as e:
-            self.logger.error(f"Kesalahan saat matching prediksi dan GT: {e}")
+        cm = confusion_matrix(y_true, y_pred, labels=cm_labels)
+
+        # Visualisasi confusion matrix
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm.T, annot=True, fmt='d', cmap='Reds',
+                    xticklabels=display_names, yticklabels=display_names,
+                    cbar=True, square=True, linewidths=.5)
+
+        plt.title(f"Confusion Matrix Multi-Kelas - Fold-{self.fold} Data Uji {self.data.upper()}-{self.engine.upper()}", fontsize=13)
+        plt.xlabel("True Labels", fontsize=12)
+        plt.ylabel("Predicted Labels", fontsize=12)
+        plt.xticks(rotation=90, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout(pad=2.5)
+
+        output_cm = self.cm_uji / f"fold_{self.fold}_cm_uji_{self.engine}.png"
+        plt.savefig(output_cm, format="png", dpi=300)
+        self.logger.info(f"\nConfusion Matrix tersimpan di path: {output_cm}")
     
-    def save_matched_predictions(self):
-        """
-        Menyimpan hasil pencocokan GT vs Prediksi ke file JSON,
-        lalu memanggil compute_confusion_matrix untuk visualisasi.
-        """
-        output_json_path = self.output_json / f"fold_{self.fold}_matched_deteksi.json"
+    def log_evaluation_metrics(self, path_matched: str, conf_threshold: float, iou_thresholds: list):
+        if isinstance(iou_thresholds, float):
+            iou_thresholds = [iou_thresholds]
 
-        try:
-            self.output_json.mkdir(parents=True, exist_ok=True)
-            with open(output_json_path, "w") as f:
-                json.dump(self.matched_data, f, indent=4)
-            self.logger.info(f"Hasil pencocokan disimpan di {output_json_path}")
+        with open(path_matched) as f:
+            data = json.load(f)
 
-            # Setelah menyimpan, buat confusion matrix
-            self.compute_confusion_matrix(output_json_path)
+        pred_by_class_iou = defaultdict(lambda: defaultdict(list))
+        n_gt_per_class = defaultdict(lambda: defaultdict(int))
+        all_classes = set()
 
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan hasil ke {output_json_path}: {e}")
+        for _, item in data.items():
+            gt_classes = item["true_classes"]
+            gt_bboxes = item["true_bboxes"]
+            pred_classes = item["pred_classes"]
+            pred_bboxes = item["pred_bboxes"]
+            scores = item["scores"]
 
-    def compute_confusion_matrix(self, matched_json_path):
-        """
-        Membuat dan menyimpan confusion matrix multi-kelas dari matched.json
-        (menggunakan score dan IoU).
-        """
-        try:
-            with open(matched_json_path, "r") as f:
-                matched_data = json.load(f)
-                self.log_detection_statistics(matched_data, title="Dengan Score + IoU")
+            for tc in gt_classes:
+                all_classes.add(tc) # untuk memastikan semua GT masuk ke set class
 
-            # Hanya ambil pasangan yang punya true_label valid
-            y_true = [item["true_label"] for item in matched_data if item["true_label"] is not None]
-            y_pred = [item["pred_label"] for item in matched_data if item["true_label"] is not None]
+            for iou_thresh in iou_thresholds:
+                used_gt = set()
+                for i, (pc, pb, score) in enumerate(zip(pred_classes, pred_bboxes, scores)):
+                    if score < conf_threshold:
+                        continue
 
-            labels = sorted(list(set(y_true + y_pred)))
-            cm = confusion_matrix(y_true, y_pred, labels=labels)
-            cm_normalized = cm.astype('float') / cm.sum(axis=1, keepdims=True)
+                    matched = False
+                    for j, (tc, tb) in enumerate(zip(gt_classes, gt_bboxes)):
+                        iou = self.compute_iou(tb, pb)
+                        if iou >= iou_thresh and j not in used_gt and tc == pc:
+                            pred_by_class_iou[pc][iou_thresh].append((score, 1))  # TP
+                            used_gt.add(j)
+                            matched = True
+                            break
 
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm_normalized, annot=True, fmt=".2f", cmap="Reds",
-                        xticklabels=labels, yticklabels=labels)
+                    if not matched:
+                        pred_by_class_iou[pc][iou_thresh].append((score, 0))  # FP
 
-            plt.xlabel("Predicted Label")
-            plt.ylabel("True Label")
-            plt.title(f"Confusion Matrix (Dengan Score + IoU) - Fold {self.fold}")
+                # Count FN per class
+                for j, tc in enumerate(gt_classes):
+                    if j not in used_gt:
+                        n_gt_per_class[tc][iou_thresh] += 1
 
-            output_img_path = self.output_cm_d / f"fold_{self.fold}_confusion_matrix_thresholded.png"
+        # Precision, Recall, mAP50
+        if 0.50 in iou_thresholds:
+            total_precision, total_recall, ap_values = [], [], []
+            for cls in all_classes:
+                preds = pred_by_class_iou[cls][0.50]
+                if not preds:
+                    continue
 
-            plt.savefig(output_img_path)
-            plt.close()
+                preds.sort(key=lambda x: -x[0])
+                tp_fp = np.array([p[1] for p in preds])
+                tp_cum = np.cumsum(tp_fp)
+                fp_cum = np.cumsum(1 - tp_fp)
 
-            self.logger.info(f"Confusion matrix (thresholded) disimpan di {output_img_path}")
-            self.logger.info(f"Total pasangan valid (GT + Pred): {len(y_true)}")
+                n_gt = n_gt_per_class[cls][0.50]
+                if n_gt == 0:
+                    continue
 
-        except Exception as e:
-            self.logger.error(f"Gagal membuat confusion matrix dari {matched_json_path}: {e}")
-    
-    # Confusion Matrix without Score
-    def extract_all_predictions_without_score(self):
-        """
-        Mengekstrak semua prediksi dari predictions.json tanpa mempertimbangkan nilai score,
-        untuk digunakan dalam analisis confusion matrix multi-kelas mentah.
-        """
-        if not self.predictions_json.exists():
-            self.logger.error(f"File prediksi tidak ditemukan: {self.predictions_json}")
-            return
+                recall = tp_cum / (n_gt + 1e-6)
+                precision = tp_cum / (tp_cum + fp_cum + 1e-6)
 
-        try:
-            with open(self.predictions_json, "r") as f:
-                data = json.load(f)
+                recall = np.clip(recall, 0, 1)
+                precision = np.clip(precision, 0, 1)
 
-            extracted_predictions = []
-            for item in data:
-                image_id = item.get("image_id")
-                category_id = item.get("category_id")
-                pred_label = self.label_mapping.get(category_id, category_id)
-                bbox = item.get("bbox", [])
+                final_precision = precision[-1] if len(precision) else 0.0
+                final_recall = recall[-1] if len(recall) else 0.0
+                ap = self.compute_ap(recall, precision)
 
-                if pred_label in self.valid_labels:
-                    extracted_predictions.append({
-                        "image_id": image_id,
-                        "pred_label": pred_label,
-                        "bbox": bbox
-                    })
+                total_precision.append(final_precision)
+                total_recall.append(final_recall)
+                ap_values.append(ap)
 
-            output_json_path = self.output_pred / f"fold_{self.fold}_raw_predictions.json"
-            self.output_pred.mkdir(parents=True, exist_ok=True)
-            with open(output_json_path, "w") as f:
-                json.dump(extracted_predictions, f, indent=4)
+            mean_precision = np.mean(total_precision) if total_precision else 0.0
+            mean_recall = np.mean(total_recall) if total_recall else 0.0
+            map50 = np.mean(ap_values) if ap_values else 0.0
 
-            self.logger.info(f"Semua prediksi tanpa score disimpan di {output_json_path}")
+            self.logger.info(f"\nMetriks Evaluasi Deteksi Model {self.engine}-{self.model_type} YOLOv8{self.size} Jenis Data {self.data.upper()} pada Fold-{self.fold} : ")
+            self.logger.info(f"[IoU 0.50] Precision: {mean_precision:.2f}, Recall: {mean_recall:.2f}, mAP50: {map50:.2f}")
 
-        except Exception as e:
-            self.logger.error(f"Kesalahan saat mengekstrak prediksi tanpa score: {e}")
+        # mAP50-95 (mean AP over all IoU thresholds)
+        all_aps = []
+        for iou_thresh in iou_thresholds:
+            ap_list = []
+            for cls in all_classes:
+                preds = pred_by_class_iou[cls][iou_thresh]
+                if not preds:
+                    continue
 
-    def match_raw_pred_with_gt(self, iou_threshold):
-        """
-        Pencocokan prediksi mentah dengan GT menggunakan IoU tanpa confidence score.
-        Mencocokkan prediksi dari raw_predictions.json (tanpa score) dengan ground truth labels.json.
-        Hasil disimpan dalam matched_raw.json untuk pembuatan confusion matrix tanpa threshold.
-        """
-        raw_pred_path = self.output_pred / f"fold_{self.fold}_raw_predictions.json"
-        if not raw_pred_path.exists():
-            self.logger.error(f"File prediksi mentah tidak ditemukan: {raw_pred_path}")
-            return
+                preds.sort(key=lambda x: -x[0])
+                tp_fp = np.array([p[1] for p in preds])
+                tp_cum = np.cumsum(tp_fp)
+                fp_cum = np.cumsum(1 - tp_fp)
 
-        try:
-            with open(raw_pred_path, "r") as f:
-                raw_predictions = json.load(f)
+                n_gt = n_gt_per_class[cls][iou_thresh]
+                if n_gt == 0:
+                    continue
 
-            gt_json_path = self.output_gt / f"fold_{self.fold}_labels.json"
-            if gt_json_path.exists():
-                with open(gt_json_path, "r") as f:
-                    ground_truth = json.load(f)
-                self.logger.info(f"Ground truth dimuat dari {gt_json_path}")
-            else:
-                ground_truth = self.load_gt_labels()
+                recall = tp_cum / (n_gt + 1e-6)
+                precision = tp_cum / (tp_cum + fp_cum + 1e-6)
+                recall = np.clip(recall, 0, 1)
+                precision = np.clip(precision, 0, 1)
 
-            self.matched_data = []
+                ap = self.compute_ap(recall, precision)
+                ap_list.append(ap)
 
-            pred_by_image = {}
-            for pred in raw_predictions:
-                image_id = str(pred["image_id"])
-                pred_by_image.setdefault(image_id, []).append(pred)
+            if ap_list:
+                all_aps.append(np.mean(ap_list))
 
-            for image_id, gt in ground_truth.items():
-                gt_classes = gt["true_classes"]
-                gt_bboxes = gt["true_bboxes"]
-                preds = pred_by_image.get(image_id, [])
-
-                matched_idxs = set()
-
-                for pred in preds:
-                    pred_class = pred["pred_label"]
-                    pred_bbox = pred["bbox"]
-
-                    best_iou = 0
-                    best_idx = -1
-                    for idx, gt_bbox in enumerate(gt_bboxes):
-                        if idx in matched_idxs:
-                            continue  # hanya cocokkan satu kali
-                        iou = self.compute_iou(pred_bbox, gt_bbox)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_idx = idx
-
-                    if best_iou >= iou_threshold:
-                        gt_class = gt_classes[best_idx]
-                        self.matched_data.append({
-                            "image_id": image_id,
-                            "true_label": gt_class,
-                            "pred_label": pred_class,
-                            "iou": best_iou
-                        })
-                        matched_idxs.add(best_idx)
-                    else:
-                        self.matched_data.append({
-                            "image_id": image_id,
-                            "true_label": None,
-                            "pred_label": pred_class,
-                            "iou": best_iou
-                        })
-
-            self.save_raw_matched_predictions()
-
-        except Exception as e:
-            self.logger.error(f"Kesalahan saat matching raw pred dan GT: {e}")
-
-    def save_raw_matched_predictions(self):
-        """
-        Menyimpan hasil pencocokan prediksi mentah dan ground truth ke dalam JSON.
-        """
-        output_json_path = self.output_json / f"fold_{self.fold}_matched_raw.json"
-
-        try:
-            self.output_json.mkdir(parents=True, exist_ok=True)
-            with open(output_json_path, "w") as f:
-                json.dump(self.matched_data, f, indent=4)
-            self.logger.info(f"Hasil pencocokan raw disimpan di {output_json_path}")
-
-            # Bisa dikomentar jika compute belum dibuat
-            # self.compute_confusion_matrix(output_json_path)
-
-        except Exception as e:
-            self.logger.error(f"Gagal menyimpan matched raw ke {output_json_path}: {e}")
-    
-    def compute_confusion_matrix_raw(self):
-        """
-        Membuat dan menyimpan confusion matrix multi-kelas dari matched_raw.json
-        (tanpa menggunakan score, tetap menggunakan IoU).
-        """
-        matched_json_path = self.output_json / f"fold_{self.fold}_matched_raw.json"
-
-        if not matched_json_path.exists():
-            self.logger.error(f"File matched_raw.json tidak ditemukan di {matched_json_path}")
-            return
-
-        try:
-            with open(matched_json_path, "r") as f:
-                matched_data = json.load(f)
-                self.log_detection_statistics(matched_data, title="Tanpa Score (IoU Only)")
-
-            # Abaikan pasangan yang tidak memiliki GT valid
-            y_true = [item["true_label"] for item in matched_data if item["true_label"] is not None]
-            y_pred = [item["pred_label"] for item in matched_data if item["true_label"] is not None]
-
-            labels = sorted(list(set(y_true + y_pred)))
-            cm = confusion_matrix(y_true, y_pred, labels=labels)
-            cm_normalized = cm.astype('float') / cm.sum(axis=1, keepdims=True)
-
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm_normalized, annot=True, fmt=".2f", cmap="Greens",
-                        xticklabels=labels, yticklabels=labels)
-
-            plt.xlabel("Predicted Label")
-            plt.ylabel("True Label")
-            plt.title(f"Confusion Matrix (Tanpa Score, IoU Only) - Fold {self.fold}")
-
-            output_img_path = self.output_cm_d / f"fold_{self.fold}_confusion_matrix_raw.png"
-            plt.savefig(output_img_path)
-            plt.close()
-
-            self.logger.info(f"Confusion matrix (raw) disimpan di {output_img_path}")
-            self.logger.info(f"Total pasangan valid (GT + Pred): {len(y_true)}")
-
-        except Exception as e:
-            self.logger.error(f"Gagal membuat confusion matrix raw dari {matched_json_path}: {e}")
+        if all_aps:
+            map5095 = np.mean(all_aps)
+            self.logger.info(f"[EVALUASI] mAP50-95: {map5095:.2f}")
+            self.logger.info(f"\n\nMetrik Evaluasi Deteksi model {self.engine} untuk Fold-{self.fold} didapatkan ! \n")
 
 class VisualisasiDatasetAwal:
     def __init__(self, class_mapping: Dict[int, str], hide_labels: bool, logger):
@@ -1441,26 +1330,62 @@ MAIN_PATH = Path("D:/Riset Skripsi/script riset/deteksi_citra/")
 DATASET_PATH = Path(f"D:/Riset Skripsi/dataset_skripsi/")
 OLAH_CONFIG = {
     'n_folds':5,
-    'score':0.5,
-    'iou':0.5
+    'conf_score':0.35,
+    'iou_map50': 0.5,
+    'iou_map5095' : [round(x,2) for x in np.arange(0.5, 1.0, 0.05)]
 }
+
+def running_det_uji(detector: PredictionDetector, olah_config: dict):
+    logger = detector.logger
+    engine_label = detector.engine.lower()
+    matched_name = f"{engine_label}_fold_{detector.fold}_uji_matched.json"
+    matched_path = detector.json_matched / matched_name
+
+    # Generate matched JSON jika belum ada
+    if not matched_path.exists():
+        logger.info(f"[INFO] Membuat file matched.json untuk {engine_label.upper()} karena belum ada.")
+        matched_path = detector.generate_json(
+            score_threshold=olah_config["conf_score"],
+            iou_threshold=olah_config["iou_map50"],
+            output_path=matched_path
+        )
+    else:
+        logger.info(f"[INFO] File matched.json {engine_label.upper()} ditemukan. Melewati pembuatan ulang.")
+
+    # Generate confusion matrix jika belum dibuat
+    if input(f"\nApakah confusion matrix untuk {engine_label.upper()} model sudah dibuat? (y/n): ").strip().lower() == 'n':
+        detector.generate_cm(
+            matched_json_path=matched_path,
+            iou_threshold=olah_config['iou_map50'],
+            score_threshold=olah_config['conf_score']
+        )
+    else:
+        logger.info(f"[INFO] Confusion Matrix {engine_label.upper()} sudah tersedia. Lanjut evaluasi...\n")
+
+    # Logging metrik evaluasi
+    logger.info(f"\n[LOGGING] Metrik Evaluasi Deteksi ({engine_label.upper()})")
+    detector.log_evaluation_metrics(
+        path_matched=matched_path,
+        conf_threshold=olah_config["conf_score"],
+        iou_thresholds=olah_config["iou_map5095"]
+    ) 
 
 def main():
     # Running Program
     print("\n=== Memulai Pembuatan Grafik Variabel-Variabel dan Confusion Matrix ===\n")
-    data = input(f"Masukkan jenis data citra yang ingin diolah hasilnya (nonbg/bg/mix): ").strip()
     
+    # Pilih jenis data
+    data = input(f"Masukkan jenis data citra yang ingin diolah hasilnya (nonbg/bg/mix): ").strip()
     # Pastikan input valid
     if data not in {"nonbg", "bg", "mix"}:
         raise ValueError(f"Jenis data '{data}' tidak valid. Harus 'nonbg', 'bg', atau 'mix'.")
     
-    # memilih salah satu
-    # Input jenis model (biasa/kustom)
+    # memilih salah satu jenis model (biasa/kustom)
     model_type = input("Masukkan hasil model yang ingin kamu gunakan (biasa/kustom): ").strip()
     if model_type not in {"biasa", "kustom"}:
         raise ValueError("Maaf, jenis model yang tersedia hanya 'biasa' atau 'kustom'.")
 
-    # Tentukan fold mode
+    # Tentukan fold yang ingin dijalankan
     fold_mode = input("Ingin menjalankan semua fold atau fold tertentu saja? (all/nomor): ").strip()
     if fold_mode == "all":
         fold_range = range(1, OLAH_CONFIG['n_folds'] + 1)
@@ -1471,62 +1396,103 @@ def main():
     
     for fold in fold_range:
         torch.cuda.empty_cache()
-        print(f"\nProcessing fold {fold}...")
-        # Pilih path hasil model fitting berdasarkan input
+        print(f"\n>>>>> Memproses fold {fold} <<<<<< \n")
+
+        # Pilih path hasil ukuran model fitting berdasarkan input
         size = input("\nMasukkan size hasil model (n/s/m/l/xl untuk biasa, s/m/l untuk kustom): ").strip()
         valid_sizes = {"n", "s", "m", "l", "xl"} if model_type == "biasa" else {"s", "m", "l"}
         if size not in valid_sizes:
             raise ValueError(f"Size model '{size}' tidak valid untuk model {model_type}.")
 
-        proses_path = MAIN_PATH /"olah_data" / data # Direktori Main Olah Data
-        log_path = proses_path /f"olah_data_{data}.txt"
-        result_path = MAIN_PATH / data / f"hasil_{data}" / model_type / f"ukuran_{size}" # Direktori Hasil Proses Fitting, dan Evaluating Model
-        json_path = result_path /f"validating_{fold}_{data}" # Direktori Hasil Proses Evaluating Model
-        labels_path = DATASET_PATH /f"dataset_{data}"/"fold"/f"fold_{fold}"/"val"/"labels" # Direktori Label Dataset Fold
+        # Path setup
+        proses_path = MAIN_PATH / data / "olah_data"
+        result_path = MAIN_PATH / data / f"hasil_{data}" / model_type / f"ukuran_{size}"
+        log_path = MAIN_PATH / data / "logging" / "olah_data"
+        log_root_path = log_path / f"olah_data_{data}.txt"
+        json_path = result_path / f"validating_{fold}_{data}"
+        hasil_uji_path = result_path / f"testing_{fold}" / "predict"
+        trt_uji_path = result_path / f"testing_trt{fold}" / "predict"
+        labels_path = DATASET_PATH / f"dataset_{data}/fold/fold_{fold}/val/labels"
+        labels_uji_path = DATASET_PATH / f"dataset_{data}/fold/test"
+
+        log_path.mkdir(parents=True, exist_ok=True)
+        proses_path.mkdir(parents=True, exist_ok=True)
+
+        logger = LoggerManager(log_file=log_root_path)
+        
         try:
-            # Inisialisasi logger
-            logger=LoggerManager(log_file=log_path)
-            
-            # Menjalankan Pemindahan Data CSV Mentah ke Data CSV Olah Data
-            logger.debug("\nMemulai Pemindahan CSV berdasarkan Variabel-Variabel nya untuk diolah ...\n")
-            csv_remaker = CSVRemaker(result_path, proses_path, fold, data, model_type, size)
-            csv_remaker.save_fold_metrics()
-            csv_remaker.save_combined_metrics()
-            logger.debug("\nPemindahan CSV telah selesai dan dapat diolah untuk Grafik dan Confusion Matrix.\n")
-            
-            # Menjalankan Plotting hasil CSV Olah Data
-            logger.debug("\nMemulai menjalankan Plotting...\n")
-            plotter = CSVPlotter(proses_path, fold, data, model_type, size)
-            plotter.plot_all()
-            logger.debug("\nPlotting telah selesai.\n")
+            # === CSV Remake ===
+            if input("Buat file CSV untuk utilisasi? (y/n): ").strip().lower() == 'y':
+                logger.info("[CSV] Memulai pemindahan data CSV...")
+                csv_remaker = CSVRemaker(result_path, proses_path, log_path, fold, data, model_type, size)
+                csv_remaker.save_fold_metrics()
+                csv_remaker.save_combined_metrics()
+                logger.info("[CSV] Selesai menyimpan file CSV utilisasi.")
 
-            # Ganti 'hasil.json' dengan path file JSON kamu
-            cm_generator =  PredictionClassificator(json_path, labels_path, proses_path, fold, data, model_type, size)
-            
-            # Menghitung dan menampilkan confusion matrix biner
-            logger.info("Memulai untuk Membuat File GT berformat JSON...")
-            cm_generator.filter_predictions()
-            cm_generator.match_pred_with_gt()
-            logger.info("Olah Data dan Confusion Matrix Binerselesai dibuat.")
+            # === Plotting Grafik ===
+            if input("Lakukan plotting grafik? (y/n): ").strip().lower() == 'y':
+                logger.info("[PLOT] Memulai proses plotting...")
+                plotter = CSVPlotter(proses_path, log_path, fold, data, model_type, size)
+                plotter.plot_all(target_folds=fold, data=data)
+                logger.info("[PLOT] Grafik selesai dibuat.")
 
-            # ===============================
-            # Deteksi Multi-Kelas (Detector)
-            # ===============================
-            logger.info("Memulai proses Confusion Matrix Deteksi Multi-Kelas...")
+            # === Confusion Matrix Validasi ===
+            if input("\nApakah kamu ingin buat confusion matrix data validasi? (y/n): ").strip().lower() == 'y':
+                logger.info("[VALIDASI] Memulai evaluasi prediksi validasi...")
 
-            detector = PredictionDetector(json_path, labels_path, proses_path, fold, data, model_type, size)
+                detector_val = ValidationDetector(
+                    predictions_json=json_path,
+                    label_dir=labels_path,
+                    olah_path=proses_path,
+                    log_path=log_path,
+                    fold=fold,
+                    data=data,
+                    model_type=model_type,
+                    size=size
+                )
 
-            # (1) Gunakan prediksi mentah (tanpa score)
-            detector.extract_all_predictions_without_score()  # Simpan raw_predictions.json
-            detector.match_raw_pred_with_gt(iou_threshold=OLAH_CONFIG['iou'])  # Cocokkan dengan IoU
-            detector.compute_confusion_matrix_raw()  # Visualisasi dan log
+                matched_path = detector_val.output_json / f"fold_{fold}_matched.json"
 
-            # (2) Gunakan prediksi dengan score threshold
-            detector.match_pred_with_gt(score_threshold=OLAH_CONFIG['score'], iou_threshold=OLAH_CONFIG['iou'])
-            # Ini otomatis akan simpan + compute confusion matrix thresholded
+                if not matched_path.exists():
+                    logger.info("[VALIDASI] File matched.json belum ada. Dibuat sekarang.")
+                    matched_path = detector_val.generate_matched_json(
+                        iou_threshold=OLAH_CONFIG["iou_map50"],
+                        score_threshold=OLAH_CONFIG["conf_score"]
+                    )
+                else:
+                    logger.info("[VALIDASI] File matched.json ditemukan. Lewati pembuatan ulang.")
 
-            logger.info("Confusion Matrix Deteksi Multi-Kelas selesai.\n")
-            
+                detector_val.generate_confusion_matrix(
+                    iou_threshold=OLAH_CONFIG["iou_map50"],
+                    score_threshold=OLAH_CONFIG["conf_score"]
+                )
+
+            # === Confusion Matrix Uji (YOLO, TRT, atau Semua) ===
+            if input("\nApakah ingin membuat confusion matrix data uji? (y/n): ").strip().lower() == 'y':
+                engine_mode = input("Evaluasi hasil dari YOLO, TRT, atau keduanya? (yolo/trt/all): ").strip().lower()
+                if engine_mode not in {"yolo", "trt", "all"}:
+                    raise ValueError("Pilihan engine harus: yolo, trt, atau all")
+
+                engine_paths = {
+                    "yolo": hasil_uji_path / "labels",
+                    "trt": trt_uji_path / "labels"
+                }
+
+                for engine in ["yolo", "trt"]:
+                    if engine_mode in {engine, "all"}:
+                        detector = PredictionDetector(
+                            label_hasil=engine_paths[engine],
+                            label_awal=labels_uji_path,
+                            olah_path=proses_path,
+                            log_path=log_path,
+                            size=size,
+                            model_type=model_type,
+                            data=data,
+                            fold=fold,
+                            engine=engine
+                        )
+                        running_det_uji(detector, olah_config=OLAH_CONFIG)
+
         except Exception as e:
             logger.error(f"\nError processing fold {fold}:")
             logger.error(f"Error details: {str(e)}")
